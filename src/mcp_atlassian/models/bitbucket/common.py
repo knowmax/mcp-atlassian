@@ -280,3 +280,119 @@ class CommitChanges(ApiModel):
             limit=data.get("limit", 25),
             next_page_start=data.get("nextPageStart"),
         )
+
+
+class BitbucketCodeSnippetLine(ApiModel):
+    """Model representing a single line in a code snippet."""
+
+    line_number: int | None = None
+    text: str | None = None
+
+    @classmethod
+    def from_api_response(
+        cls, data: dict[str, Any], **kwargs: Any
+    ) -> "BitbucketCodeSnippetLine":
+        """Create a BitbucketCodeSnippetLine from API response."""
+        if not data:
+            return cls()
+
+        # Remove HTML emphasis tags from text
+        text = data.get("text", "")
+        if text:
+            text = text.replace("<em>", "").replace("</em>", "")
+
+        return cls(line_number=data.get("line"), text=text)
+
+
+class BitbucketCodeSearchResultItem(ApiModel):
+    """Model representing a single code search result item."""
+
+    project_key: str | None = None
+    project_name: str | None = None
+    repository_name: str | None = None
+    repository_slug: str | None = None
+    file_path: str | None = None
+    hit_count: int = 0
+    code_snippets: list[list[BitbucketCodeSnippetLine]] = Field(default_factory=list)
+
+    @classmethod
+    def from_api_response(
+        cls, data: dict[str, Any], **kwargs: Any
+    ) -> "BitbucketCodeSearchResultItem":
+        """Create a BitbucketCodeSearchResultItem from API response."""
+        if not data:
+            return cls()
+
+        # Extract repository and project information
+        repo = data.get("repository", {})
+        project = repo.get("project", {})
+
+        # Process hit contexts (code snippets)
+        snippets = []
+        for context_group in data.get("hitContexts", []):
+            snippet_lines = []
+            for line_obj in context_group:
+                snippet_lines.append(
+                    BitbucketCodeSnippetLine.from_api_response(line_obj)
+                )
+            if snippet_lines:
+                snippets.append(snippet_lines)
+
+        # Extract file path - handle both string and object formats
+        file_data = data.get("file", {})
+        if isinstance(file_data, str):
+            file_path = file_data
+        elif isinstance(file_data, dict):
+            path_data = file_data.get("path", {})
+            if isinstance(path_data, str):
+                file_path = path_data
+            elif isinstance(path_data, dict):
+                file_path = path_data.get("toString")
+            else:
+                file_path = None
+        else:
+            file_path = None
+
+        return cls(
+            project_key=project.get("key"),
+            project_name=project.get("name"),
+            repository_name=repo.get("name"),
+            repository_slug=repo.get("slug"),
+            file_path=file_path,
+            hit_count=len(data.get("hitContexts", [])),
+            code_snippets=snippets,
+        )
+
+
+class BitbucketCodeSearchResult(ApiModel):
+    """Model representing code search results with pagination metadata."""
+
+    total_count: int = 0
+    start: int = 0
+    next_start: int | None = None
+    is_last_page: bool = True
+    results: list[BitbucketCodeSearchResultItem] = Field(default_factory=list)
+
+    @classmethod
+    def from_api_response(
+        cls, data: dict[str, Any], **kwargs: Any
+    ) -> "BitbucketCodeSearchResult":
+        """Create a BitbucketCodeSearchResult from API response."""
+        if not data:
+            return cls()
+
+        # Extract code search data
+        code_data = data.get("code", {})
+
+        # Process search results
+        results = []
+        for item in code_data.get("values", []):
+            results.append(BitbucketCodeSearchResultItem.from_api_response(item))
+
+        return cls(
+            total_count=code_data.get("count", 0),
+            start=code_data.get("start", 0),
+            next_start=code_data.get("nextStart"),
+            is_last_page=code_data.get("isLastPage", True),
+            results=results,
+        )

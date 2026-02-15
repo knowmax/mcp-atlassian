@@ -7,6 +7,7 @@ from .client import BitbucketClient
 from .config import BitbucketConfig
 from .pullrequests import PullRequestsMixin
 from .repositories import RepositoriesMixin
+from .search import SearchMixin
 from .users import UsersMixin
 from .workspaces import WorkspacesMixin
 
@@ -17,6 +18,7 @@ class BitbucketFetcher(
     RepositoriesMixin,
     BranchesMixin,
     PullRequestsMixin,
+    SearchMixin,
 ):
     """
     The main Bitbucket client class providing access to all Bitbucket operations.
@@ -27,10 +29,11 @@ class BitbucketFetcher(
     - RepositoriesMixin: Repository operations, file content, and directory listing
     - BranchesMixin: Branch operations and commit history
     - PullRequestsMixin: Pull request operations and related functionality
+    - SearchMixin: Code search operations (Server/Data Center only)
 
-    The class follows the same mixin architecture pattern as JiraFetcher and ConfluenceFetcher,
-    providing a unified interface for all Bitbucket API operations while maintaining
-    separation of concerns through focused mixins.
+    The class follows the same mixin architecture pattern as JiraFetcher and
+    ConfluenceFetcher, providing a unified interface for all Bitbucket API
+    operations while maintaining separation of concerns through focused mixins.
     """
 
     pass
@@ -45,5 +48,6 @@ __all__ = [
     "RepositoriesMixin",
     "BranchesMixin",
     "PullRequestsMixin",
+    "SearchMixin",
     "Bitbucket",
 ]

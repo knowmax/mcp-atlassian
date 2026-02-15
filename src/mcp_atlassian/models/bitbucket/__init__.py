@@ -2,6 +2,9 @@
 
 from .common import (
     BitbucketBranch,
+    BitbucketCodeSearchResult,
+    BitbucketCodeSearchResultItem,
+    BitbucketCodeSnippetLine,
     BitbucketCommit,
     BitbucketPullRequest,
     BitbucketRepository,
@@ -16,4 +19,7 @@ __all__ = [
     "BitbucketPullRequest",
     "BitbucketCommit",
     "BitbucketUser",
+    "BitbucketCodeSearchResult",
+    "BitbucketCodeSearchResultItem",
+    "BitbucketCodeSnippetLine",
 ]

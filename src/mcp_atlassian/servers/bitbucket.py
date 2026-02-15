@@ -1078,3 +1078,657 @@ async def add_pull_request_comment(
             log_level, f"bitbucket_add_pull_request_comment failed: {error_message}"
         )
         return json.dumps(error_result, indent=2)
+
+
+@bitbucket_mcp.tool(tags={"bitbucket", "read"})
+async def search_code(
+    ctx: Context,
+    query: Annotated[
+        str,
+        Field(description="Search query string to match against code content"),
+    ],
+    start: Annotated[
+        int,
+        Field(description="Starting index for pagination", default=0, ge=0),
+    ] = 0,
+    limit: Annotated[
+        int,
+        Field(
+            description="Maximum number of results per page",
+            default=10,
+            ge=1,
+            le=100,
+        ),
+    ] = 10,
+    branch: Annotated[
+        str | None,
+        Field(
+            description="Optional branch name to search within (e.g., 'main', 'develop', 'feature/my-branch')",
+            default=None,
+        ),
+    ] = None,
+    repository: Annotated[
+        str | None,
+        Field(
+            description="Optional repository slug to limit search scope",
+            default=None,
+        ),
+    ] = None,
+    project: Annotated[
+        str | None,
+        Field(
+            description="Optional project key to limit search scope",
+            default=None,
+        ),
+    ] = None,
+) -> str:
+    """
+    Search for code across Bitbucket repositories with optional filtering.
+
+    This tool searches code content across repositories using the Bitbucket
+    Server/Data Center search API. Results include code snippets with matching
+    lines highlighted. You can optionally filter by branch, repository, and/or project.
+
+    When repository and/or project filters are specified, the tool automatically
+    fetches additional pages (up to 10) to ensure you get the requested number
+    of filtered results, since filtering happens client-side.
+
+    Note:
+        This feature is only available for Bitbucket Server/Data Center.
+        It is NOT supported in Bitbucket Cloud.
+
+    Args:
+        ctx: The MCP context.
+        query: Search query string to match against code content.
+        start: Starting index for pagination (default: 0).
+        limit: Maximum number of results per page (default: 10, max: 100).
+        branch: Optional branch name to search within (e.g., 'main', 'develop').
+        repository: Optional repository slug to limit search scope (auto-fetches pages).
+        project: Optional project key to limit search scope (auto-fetches pages).
+
+    Returns:
+        JSON string containing search results with code snippets and pagination
+        metadata.
+
+    Raises:
+        ValueError: If called on a Bitbucket Cloud instance.
+        
+    Examples:
+        Search all repositories: search_code(query="def main")
+        Search specific branch: search_code(query="def main", branch="develop")
+        Search in specific repo: search_code(query="manifest", repository="taas-spydr", project="ASX-XENA")
+    """
+    try:
+        bitbucket = await get_bitbucket_fetcher(ctx)
+        
+        # Auto-quote multi-word queries for phrase search
+        # Skip if query already has quotes or appears to be using search operators
+        processed_query = query
+        if " " in query and not any(
+            marker in query for marker in ['"', "AND", "OR", "NOT"]
+        ):
+            processed_query = f'"{query}"'
+            logger.info(
+                f"Auto-quoting multi-word query for phrase search: {processed_query}"
+            )
+        
+        search_result = bitbucket.search_code(
+            query=processed_query,
+            start=start,
+            limit=limit,
+            branch=branch,
+            repository=repository,
+            project=project,
+        )
+
+        # Convert model to dictionary for JSON serialization
+        result_dict = search_result.model_dump(mode="json", serialize_as_any=True)
+
+        # If total count exceeds 10,000, provide summary instead of full details
+        if search_result.total_count > 10000:
+            # Create a summarized version with limited code snippets
+            summarized_results = []
+            for result in search_result.results:
+                # Limit code snippets to first 2 per file
+                limited_snippets = result.code_snippets[:2] if result.code_snippets else []
+                # Limit lines in each snippet to first 5
+                limited_snippets = [
+                    snippet[:5] for snippet in limited_snippets
+                ]
+
+                summarized_result = {
+                    "project_key": result.project_key,
+                    "project_name": result.project_name,
+                    "repository_name": result.repository_name,
+                    "repository_slug": result.repository_slug,
+                    "file_path": result.file_path,
+                    "hit_count": result.hit_count,
+                    "code_snippets": [[{"line_number": line.line_number, "text": line.text} for line in snippet] for snippet in limited_snippets],
+                    "_note": "Code snippets limited due to large result set"
+                }
+                summarized_results.append(summarized_result)
+
+            result_dict = {
+                "total_count": search_result.total_count,
+                "start": search_result.start,
+                "next_start": search_result.next_start,
+                "is_last_page": search_result.is_last_page,
+                "results": summarized_results,
+                "_warning": f"Large result set detected ({search_result.total_count} total matches). Showing first {len(search_result.results)} results with limited code snippets. Use pagination (start/limit) to retrieve more specific results."
+            }
+
+        # Add warning if repository/project filter was used but returned fewer results than requested
+        if (repository or project) and len(search_result.results) < limit:
+            if result_dict.get("_warning"):
+                result_dict["_warning"] += f" | Filtered for repository='{repository}' project='{project}' but found only {len(search_result.results)} results out of {limit} requested. Results for this repository may be sparse in the overall result set."
+            else:
+                result_dict["_info"] = f"Filtered for repository='{repository}' project='{project}'. Found {len(search_result.results)} results out of {limit} requested."
+
+        return json.dumps(result_dict, indent=2)
+    except ValueError as val_err:
+        # Handle the Cloud vs Server/DC validation error
+        error_message = str(val_err)
+        error_result = {
+            "success": False,
+            "error": error_message,
+        }
+        logger.warning(f"bitbucket_search_code validation error: {error_message}")
+        return json.dumps(error_result, indent=2)
+    except Exception as e:
+        error_message = ""
+        log_level = logging.ERROR
+        if isinstance(e, MCPAtlassianAuthenticationError):
+            error_message = f"Authentication/Permission Error: {str(e)}"
+        elif isinstance(e, OSError | HTTPError):
+            error_message = f"Network or API Error: {str(e)}"
+        else:
+            error_message = (
+                f"An unexpected error occurred while searching code for query: {query}"
+            )
+            logger.exception("Unexpected error in bitbucket_search_code:")
+
+        error_result = {
+            "success": False,
+            "error": error_message,
+        }
+        logger.log(log_level, f"bitbucket_search_code failed: {error_message}")
+        return json.dumps(error_result, indent=2)
+
+
+@bitbucket_mcp.tool(tags={"bitbucket", "read"})
+async def deep_search_code(
+    ctx: Context,
+    query: Annotated[
+        str,
+        Field(description="Search query string to match against code content"),
+    ],
+    workspace: Annotated[
+        str,
+        Field(description="Workspace name (Cloud) or project key (Server/DC)"),
+    ],
+    repository: Annotated[
+        str,
+        Field(description="Repository slug/name"),
+    ],
+    branch: Annotated[
+        str | None,
+        Field(
+            description="Optional specific branch name to search in (e.g., 'develop', 'main')",
+            default=None,
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Field(
+            description="Maximum number of results to return",
+            default=10,
+            ge=1,
+            le=100,
+        ),
+    ] = 10,
+    search_all_branches_on_miss: Annotated[
+        bool,
+        Field(
+            description="If True and no results found in specified branch, search all branches",
+            default=True,
+        ),
+    ] = True,
+) -> str:
+    """
+    Deep search for code in a specific repository with automatic branch fallback.
+
+    This tool performs an intelligent search:
+    1. If branch is specified, searches in that branch first
+    2. If no results found in specified branch (and search_all_branches_on_miss=True),
+       automatically searches across all branches in the repository
+    3. Returns results grouped by branch with metadata
+
+    This is perfect when you want to find code but aren't sure which branch it's in,
+    or when you want to see if code exists across multiple branches.
+
+    Note:
+        This feature is only available for Bitbucket Server/Data Center.
+        It is NOT supported in Bitbucket Cloud.
+
+    Args:
+        ctx: The MCP context.
+        query: Search query string to match against code content.
+        workspace: Workspace name (Cloud) or project key (Server/DC).
+        repository: Repository slug/name.
+        branch: Optional specific branch name to search in.
+        limit: Maximum number of results to return (default: 10).
+        search_all_branches_on_miss: If True, search all branches if target branch has no results.
+
+    Returns:
+        JSON string with results grouped by branch, including:
+        - query: Original search query
+        - repository: Repository info
+        - target_branch: Initially requested branch
+        - searched_branches: List of branches that were searched
+        - results_by_branch: Results organized by branch
+        - total_results: Total number of matches
+        - found_in_target_branch: Whether results were found in the target branch
+
+    Examples:
+        # Search in develop branch, fallback to all branches
+        deep_search_code(query="customfield_10531", workspace="ITX-ALE", 
+                        repository="xena-jira-ai", branch="develop")
+        
+        # Search only in specific branch (no fallback)
+        deep_search_code(query="customfield", workspace="ITX-ALE",
+                        repository="xena-jira-ai", branch="main", 
+                        search_all_branches_on_miss=False)
+    """
+    try:
+        bitbucket = await get_bitbucket_fetcher(ctx)
+        
+        # Auto-quote multi-word queries for phrase search
+        # Skip if query already has quotes or appears to be using search operators
+        processed_query = query
+        if " " in query and not any(
+            marker in query for marker in ['"', "AND", "OR", "NOT"]
+        ):
+            processed_query = f'"{query}"'
+            logger.info(
+                f"Auto-quoting multi-word query for phrase search: {processed_query}"
+            )
+        
+        result = bitbucket.deep_search_code(
+            query=processed_query,
+            workspace=workspace,
+            repository=repository,
+            branch=branch,
+            limit=limit,
+            search_all_branches_on_miss=search_all_branches_on_miss,
+        )
+
+        return json.dumps(result, indent=2)
+    except ValueError as val_err:
+        error_message = str(val_err)
+        error_result = {
+            "success": False,
+            "error": error_message,
+        }
+        logger.warning(f"bitbucket_deep_search_code validation error: {error_message}")
+        return json.dumps(error_result, indent=2)
+    except Exception as e:
+        error_message = ""
+        log_level = logging.ERROR
+        if isinstance(e, MCPAtlassianAuthenticationError):
+            error_message = f"Authentication/Permission Error: {str(e)}"
+        elif isinstance(e, OSError | HTTPError):
+            error_message = f"Network or API Error: {str(e)}"
+        else:
+            error_message = (
+                f"An unexpected error occurred during deep search for query: {query}"
+            )
+            logger.exception("Unexpected error in bitbucket_deep_search_code:")
+
+        error_result = {
+            "success": False,
+            "error": error_message,
+        }
+        logger.log(log_level, f"bitbucket_deep_search_code failed: {error_message}")
+        return json.dumps(error_result, indent=2)
+
+
+@bitbucket_mcp.tool(tags={"bitbucket", "read"})
+async def smart_search_code(
+    ctx: Context,
+    query: Annotated[
+        str,
+        Field(description="Search query string to match against code content"),
+    ],
+    workspace: Annotated[
+        str | None,
+        Field(
+            description="Workspace name (Cloud) or project key (Server/DC). Required when using branch-specific search.",
+            default=None,
+        ),
+    ] = None,
+    repository: Annotated[
+        str | None,
+        Field(
+            description="Repository slug/name. Required when using branch-specific search.",
+            default=None,
+        ),
+    ] = None,
+    branch: Annotated[
+        str | None,
+        Field(
+            description="Optional branch name. When specified with workspace and repository, uses deep search with automatic fallback across all branches.",
+            default=None,
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Field(
+            description="Maximum number of results to return",
+            default=10,
+            ge=1,
+            le=100,
+        ),
+    ] = 10,
+    start: Annotated[
+        int,
+        Field(description="Starting index for pagination (used only in normal search)", default=0, ge=0),
+    ] = 0,
+) -> str:
+    """
+    **DEFAULT CODE SEARCH TOOL** - Smart code search that automatically chooses the best search strategy.
+
+    **Use this tool for ALL code search requests unless the user explicitly asks for page-based navigation.**
+
+    This tool intelligently routes your search:
+    - When branch + workspace + repository are provided → Uses deep search with automatic 
+      fallback across all branches in that specific repository
+    - Otherwise → Uses normal cross-repository search
+
+    This is the primary code search tool. Use search_code_paginated ONLY when users explicitly
+    request page-based navigation (e.g., "show me page 2", "next page", "page 3 of results").
+
+    Note:
+        This feature is only available for Bitbucket Server/Data Center.
+        It is NOT supported in Bitbucket Cloud.
+
+    Args:
+        ctx: The MCP context.
+        query: Search query string to match against code content.
+        workspace: Workspace name or project key (required for branch-specific search).
+        repository: Repository slug/name (required for branch-specific search).
+        branch: Optional branch name. Triggers deep search when provided with workspace and repository.
+        limit: Maximum number of results to return (default: 10, max: 100).
+        start: Starting index for pagination (used only in normal search).
+
+    Returns:
+        JSON string with search results. Format varies based on search type used:
+        - Deep search: Results grouped by branch with metadata
+        - Normal search: Standard search results with pagination
+
+    Examples:
+        # Branch-specific search (uses deep search)
+        smart_search_code(query="customfield", workspace="ITX-ALE", 
+                         repository="xena-jira-ai", branch="develop")
+        
+        # Cross-repository search (uses normal search)
+        smart_search_code(query="xena.dev", limit=30)
+        
+        # Repository-scoped search without branch (uses normal search)
+        smart_search_code(query="manifest", repository="xena-jira-ai", 
+                         workspace="ITX-ALE")
+    """
+    try:
+        bitbucket = await get_bitbucket_fetcher(ctx)
+        
+        # Auto-quote multi-word queries for phrase search
+        # Skip if query already has quotes or appears to be using search operators
+        processed_query = query
+        if " " in query and not any(
+            marker in query for marker in ['"', "AND", "OR", "NOT"]
+        ):
+            processed_query = f'"{query}"'
+            logger.info(
+                f"Auto-quoting multi-word query for phrase search: {processed_query}"
+            )
+        
+        # Decision logic: Use deep search if branch is specified with workspace and repository
+        if branch and workspace and repository:
+            logger.info(
+                f"Using deep search for '{processed_query}' in {workspace}/{repository} "
+                f"(branch: {branch})"
+            )
+            result = bitbucket.deep_search_code(
+                query=processed_query,
+                workspace=workspace,
+                repository=repository,
+                branch=branch,
+                limit=limit,
+                search_all_branches_on_miss=True,
+            )
+            return json.dumps(result, indent=2)
+        else:
+            # Use normal search
+            logger.info(
+                f"Using normal search for '{processed_query}' "
+                f"(workspace: {workspace}, repository: {repository}, branch: {branch})"
+            )
+            search_result = bitbucket.search_code(
+                query=processed_query,
+                start=start,
+                limit=limit,
+                branch=branch,
+                repository=repository,
+                project=workspace,
+            )
+            
+            # Convert model to dictionary for JSON serialization
+            result_dict = search_result.model_dump(mode="json", serialize_as_any=True)
+            
+            # If total count exceeds 10,000, provide summary
+            if search_result.total_count > 10000:
+                summarized_results = []
+                for result in search_result.results:
+                    limited_snippets = result.code_snippets[:2] if result.code_snippets else []
+                    limited_snippets = [snippet[:5] for snippet in limited_snippets]
+                    
+                    summarized_result = {
+                        "project_key": result.project_key,
+                        "project_name": result.project_name,
+                        "repository_name": result.repository_name,
+                        "repository_slug": result.repository_slug,
+                        "file_path": result.file_path,
+                        "hit_count": result.hit_count,
+                        "code_snippets": [
+                            [{"line_number": line.line_number, "text": line.text} for line in snippet]
+                            for snippet in limited_snippets
+                        ],
+                        "_note": "Code snippets limited due to large result set"
+                    }
+                    summarized_results.append(summarized_result)
+                
+                result_dict["results"] = summarized_results
+                result_dict["_info"] = (
+                    f"Large result set ({search_result.total_count} total). "
+                    "Code snippets have been summarized. Use more specific filters "
+                    "or pagination to get detailed results."
+                )
+            
+            return json.dumps(result_dict, indent=2)
+            
+    except ValueError as val_err:
+        error_message = str(val_err)
+        error_result = {
+            "success": False,
+            "error": error_message,
+        }
+        logger.warning(f"smart_search_code validation error: {error_message}")
+        return json.dumps(error_result, indent=2)
+    except Exception as e:
+        error_message = ""
+        log_level = logging.ERROR
+        if isinstance(e, MCPAtlassianAuthenticationError):
+            error_message = f"Authentication/Permission Error: {str(e)}"
+        elif isinstance(e, OSError | HTTPError):
+            error_message = f"Network or API Error: {str(e)}"
+        else:
+            error_message = (
+                f"An unexpected error occurred during search for query: {query}"
+            )
+            logger.exception("Unexpected error in smart_search_code:")
+        
+        error_result = {
+            "success": False,
+            "error": error_message,
+        }
+        logger.log(log_level, f"smart_search_code failed: {error_message}")
+        return json.dumps(error_result, indent=2)
+
+
+@bitbucket_mcp.tool(tags={"bitbucket", "read"})
+async def search_code_paginated(
+    ctx: Context,
+    query: Annotated[
+        str,
+        Field(description="Search query string to match against code content"),
+    ],
+    page: Annotated[
+        int,
+        Field(description="Page number (1-based)", default=1, ge=1),
+    ] = 1,
+    page_size: Annotated[
+        int,
+        Field(
+            description="Results per page",
+            default=10,
+            ge=1,
+            le=100,
+        ),
+    ] = 10,
+    branch: Annotated[
+        str | None,
+        Field(
+            description="Optional branch name to search within",
+            default=None,
+        ),
+    ] = None,
+    repository: Annotated[
+        str | None,
+        Field(
+            description="Optional repository slug to limit search scope",
+            default=None,
+        ),
+    ] = None,
+    project: Annotated[
+        str | None,
+        Field(
+            description="Optional project key to limit search scope",
+            default=None,
+        ),
+    ] = None,
+) -> str:
+    """
+    **ONLY USE WHEN USER EXPLICITLY REQUESTS PAGE-BASED NAVIGATION.**
+
+    Search code with user-friendly page-based pagination. Use this tool ONLY when the user
+    specifically asks for page navigation (e.g., "show page 2", "next page", "go to page 3").
+
+    For all other code search requests, use smart_search_code instead.
+
+    This tool makes it easy to navigate through search results using page numbers
+    instead of managing start indices. Perfect for implementing "next page" / 
+    "previous page" functionality.
+
+    The response includes helpful pagination metadata:
+    - Current page and total pages
+    - has_next / has_previous flags
+    - next_page / previous_page numbers
+
+    Note:
+        This feature is only available for Bitbucket Server/Data Center.
+        It is NOT supported in Bitbucket Cloud.
+
+    Args:
+        ctx: The MCP context.
+        query: Search query string to match against code content.
+        page: Page number (1-based, default: 1).
+        page_size: Results per page (default: 10, max: 100).
+        branch: Optional branch name to search within.
+        repository: Optional repository slug to limit search scope.
+        project: Optional project key to limit search scope.
+
+    Returns:
+        JSON string containing:
+        - query: Original search query
+        - page: Current page number
+        - page_size: Results per page
+        - total_count: Total number of matches
+        - total_pages: Total number of pages
+        - has_next: Boolean indicating if there's a next page
+        - has_previous: Boolean indicating if there's a previous page
+        - next_page: Next page number (or null)
+        - previous_page: Previous page number (or null)
+        - results: List of search results for current page
+        - filters: Applied filters
+
+    Examples:
+        # Get first page
+        search_code_paginated(query="customfield", page=1)
+        
+        # Get next page
+        search_code_paginated(query="customfield", page=2)
+        
+        # Get page 3 with 20 results per page, filtered by repository
+        search_code_paginated(query="customfield", page=3, page_size=20,
+                             repository="xena-jira-ai", project="ITX-ALE")
+    """
+    try:
+        bitbucket = await get_bitbucket_fetcher(ctx)
+        
+        # Auto-quote multi-word queries for phrase search
+        # Skip if query already has quotes or appears to be using search operators
+        processed_query = query
+        if " " in query and not any(
+            marker in query for marker in ['"', "AND", "OR", "NOT"]
+        ):
+            processed_query = f'"{query}"'
+            logger.info(
+                f"Auto-quoting multi-word query for phrase search: {processed_query}"
+            )
+        
+        result = bitbucket.search_code_paginated(
+            query=processed_query,
+            page=page,
+            page_size=page_size,
+            branch=branch,
+            repository=repository,
+            project=project,
+        )
+
+        return json.dumps(result, indent=2)
+    except ValueError as val_err:
+        error_message = str(val_err)
+        error_result = {
+            "success": False,
+            "error": error_message,
+        }
+        logger.warning(f"bitbucket_search_code_paginated validation error: {error_message}")
+        return json.dumps(error_result, indent=2)
+    except Exception as e:
+        error_message = ""
+        log_level = logging.ERROR
+        if isinstance(e, MCPAtlassianAuthenticationError):
+            error_message = f"Authentication/Permission Error: {str(e)}"
+        elif isinstance(e, OSError | HTTPError):
+            error_message = f"Network or API Error: {str(e)}"
+        else:
+            error_message = (
+                f"An unexpected error occurred during paginated search for query: {query}"
+            )
+            logger.exception("Unexpected error in bitbucket_search_code_paginated:")
+
+        error_result = {
+            "success": False,
+            "error": error_message,
+        }
+        logger.log(log_level, f"bitbucket_search_code_paginated failed: {error_message}")
+        return json.dumps(error_result, indent=2)
